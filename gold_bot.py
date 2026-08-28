@@ -22,30 +22,66 @@ from anthropic import Anthropic
 
 # ---------- 1. COLLECT ----------
 
-# Free RSS feeds that mention gold / precious metals / Fed policy.
-# Feel free to add or remove feeds here later.
+# Free RSS feeds covering gold directly, plus general markets/economy feeds
+# (gold-moving news often shows up there before it's framed as "gold news").
 RSS_FEEDS = [
     "https://www.investing.com/rss/commodities_Gold.rss",
     "https://www.fxstreet.com/rss/news",
     "https://www.kitco.com/rss/KitcoNews.xml",
+    "https://www.investing.com/rss/news_25.rss",          # economic indicators
+    "https://www.investing.com/rss/news_285.rss",         # Fed / central banks
+    "https://www.marketwatch.com/rss/topstories",
+    "https://www.cnbc.com/id/20910258/device/rss/rss.html",  # CNBC top news
+    "https://www.federalreserve.gov/feeds/press_all.xml",  # Fed press releases, straight from the source
 ]
 
-MAX_HEADLINES = 12  # keep the AI bill small and the message short
+# Tier 1: headline mentions gold/precious metals directly -> always keep.
+GOLD_KEYWORDS = ["gold", "bullion", "xau", "precious metal"]
+
+# Tier 2: no "gold" word, but these are the big levers that move gold's price
+# even when gold isn't named in the headline (rates, inflation, dollar,
+# safe-haven triggers, and gold's biggest buyers/sellers).
+MACRO_KEYWORDS = [
+    # central bank / interest rates
+    "federal reserve", "fed chair", "fomc", "interest rate", "rate hike",
+    "rate cut", "rate decision", "jackson hole", "central bank",
+    "ecb", "bank of japan", "boj",
+    # inflation
+    "inflation", "cpi", "pce", "consumer price index", "core inflation",
+    # currency & bonds
+    "dollar index", "u.s. dollar", "us dollar", "greenback", "treasury yield",
+    "bond yield", "10-year yield", "real yields",
+    # jobs / growth
+    "nonfarm payrolls", "jobs report", "unemployment rate", "recession",
+    "gdp growth",
+    # safe-haven triggers
+    "geopolitical", "war", "sanctions", "conflict", "banking crisis",
+    "debt ceiling", "government shutdown", "sovereign debt",
+    # fiscal / debt
+    "budget deficit", "national debt", "treasury buyback",
+    # market stress (risk-off often = gold up)
+    "stock market selloff", "market crash", "safe haven",
+]
+
+MAX_HEADLINES = 15  # keep the AI bill small and the message short
 
 
 def collect_headlines():
-    """Pull headlines from RSS feeds, filter to ones that actually mention gold."""
+    """Pull headlines from RSS feeds, keeping ones about gold directly
+    or about the big macro levers that move gold's price."""
     headlines = []
-    keywords = ["gold", "bullion", "xau", "precious metal"]
 
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:15]:
+            for entry in feed.entries[:20]:
                 title = entry.get("title", "").strip()
                 if not title:
                     continue
-                if any(k in title.lower() for k in keywords):
+                title_lower = title.lower()
+                is_gold = any(k in title_lower for k in GOLD_KEYWORDS)
+                is_macro = any(k in title_lower for k in MACRO_KEYWORDS)
+                if is_gold or is_macro:
                     headlines.append({
                         "title": title,
                         "source": feed.feed.get("title", url),
