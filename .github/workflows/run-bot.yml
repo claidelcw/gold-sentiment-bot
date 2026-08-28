@@ -2,9 +2,10 @@ name: Gold Sentiment Bot
 
 on:
   schedule:
-    # Runs at minute 0, every 3 hours, Monday-Friday (UTC time)
-    - cron: "0 */3 * * 1-5"
-  workflow_dispatch: {}   # lets you click "Run workflow" manually on GitHub to test it
+    - cron: "0 21-23 * * 0"   # Sunday 21:00–23:00 UTC (your 23:00–01:00)
+    - cron: "0 * * * 1-4"     # Monday–Thursday, every hour, all day
+    - cron: "0 0-16 * * 5"    # Friday 00:00–16:00 UTC (your 02:00–18:00)
+  workflow_dispatch: {}
 
 jobs:
   run-bot:
