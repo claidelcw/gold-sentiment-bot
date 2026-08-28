@@ -27,9 +27,15 @@ Install deps:
 IMPORTANT CAVEATS (read before trusting the numbers):
   - This checks DIRECTIONAL accuracy of the sentiment call, not real trading
     P&L. It ignores spread, slippage, and execution delay.
-  - Alpha Vantage free tier = 25 requests/day. One request can return up to
-    1000 articles for a date range, so a single run usually fits in 1 call,
-    but don't re-run this script many times in a day while testing.
+  - Alpha Vantage free tier = 25 requests/day. This script makes one request
+    PER TOPIC (see NEWS_TOPICS below), so a single run uses a few of your 25.
+  - Alpha Vantage caps each request at 1000 articles and returns the
+    EARLIEST 1000 within your time_from/time_to window when sort=EARLIEST.
+    If your window has more than 1000 matching articles for a topic, the
+    extras are silently dropped and your headlines will cluster at the
+    START of the window instead of spreading across it. Keep LOOKBACK_DAYS
+    modest (default 30) unless you've checked your topic/window doesn't
+    exceed the cap.
   - yfinance hourly ("1h") data is only available for roughly the last 730
     days. For older history you'd need daily ("1d") resolution instead.
   - A backtest showing an edge does NOT guarantee that edge holds going
@@ -57,7 +63,7 @@ ALPHA_VANTAGE_KEY = os.environ["ALPHAVANTAGE_API_KEY"]
 client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
 
 GOLD_TICKER = "GC=F"          # COMEX gold futures on yfinance
-LOOKBACK_DAYS = 180           # how far back to pull headlines (tune as needed)
+LOOKBACK_DAYS = 30            # how far back to pull headlines (see cap note below)
 FORWARD_WINDOWS_HOURS = (4, 24)  # check price move 4h and 24h after each headline
 JUDGE_BATCH_SIZE = 20         # headlines per Claude call (keeps prompts manageable)
 
@@ -87,13 +93,17 @@ def is_relevant(title):
 
 # ---------- 1. FETCH HISTORICAL HEADLINES ----------
 
-def fetch_historical_headlines(time_from, time_to, limit=1000):
-    """Pull historical headlines with real publish timestamps from Alpha
-    Vantage. Returns a list of dicts: title, time_published (UTC datetime), source."""
+# Query topics one at a time (rather than comma-joined in one call) — more
+# robust, and only uses a few of your 25 free daily requests per run.
+NEWS_TOPICS = ["financial_markets", "economy_macro", "economy_monetary"]
+
+
+def fetch_headlines_for_topic(topic, time_from, time_to, limit=1000):
+    """Pull historical headlines for ONE topic from Alpha Vantage."""
     url = "https://www.alphavantage.co/query"
     params = {
         "function": "NEWS_SENTIMENT",
-        "topics": "economy_macro,financial_markets,economy_monetary",
+        "topics": topic,
         "time_from": time_from.strftime("%Y%m%dT%H%M"),
         "time_to": time_to.strftime("%Y%m%dT%H%M"),
         "limit": limit,
@@ -105,7 +115,7 @@ def fetch_historical_headlines(time_from, time_to, limit=1000):
     data = resp.json()
 
     if "feed" not in data:
-        print(f"Alpha Vantage returned no 'feed' key. Raw response: {data}")
+        print(f"  Alpha Vantage returned no 'feed' for topic '{topic}': {data}")
         return []
 
     headlines = []
@@ -122,9 +132,24 @@ def fetch_historical_headlines(time_from, time_to, limit=1000):
             "title": title,
             "time_published": ts,
             "source": item.get("source", ""),
+            "url": item.get("url", ""),
         })
-
     return headlines
+
+
+def fetch_historical_headlines(time_from, time_to, limit=1000):
+    """Pull historical headlines across all NEWS_TOPICS, deduped by URL.
+    Uses one Alpha Vantage request per topic (len(NEWS_TOPICS) total)."""
+    seen_urls = set()
+    all_headlines = []
+    for topic in NEWS_TOPICS:
+        print(f"  Fetching topic '{topic}'...")
+        for h in fetch_headlines_for_topic(topic, time_from, time_to, limit):
+            if h["url"] and h["url"] in seen_urls:
+                continue
+            seen_urls.add(h["url"])
+            all_headlines.append(h)
+    return all_headlines
 
 
 # ---------- 2. FETCH HISTORICAL GOLD PRICES ----------
