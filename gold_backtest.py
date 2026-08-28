@@ -1,0 +1,398 @@
+"""
+Gold Sentiment Backtester
+--------------------------
+Tests whether the bot's bullish/bearish/neutral calls on HISTORICAL headlines
+would have matched gold's actual price direction afterward.
+
+Pipeline:
+  1. FETCH HEADLINES  - pull historical gold/macro headlines from Alpha Vantage
+                        News Sentiment API (with real publish timestamps)
+  2. FETCH PRICES     - pull historical gold futures (GC=F) prices via yfinance
+  3. JUDGE            - run the same bullish/bearish/neutral prompt as the live
+                        bot, batched, against every historical headline
+  4. SCORE            - for each headline, measure gold's % price move over the
+                        next N hours and check it against the verdict
+  5. REPORT           - print hit rates / average returns per verdict bucket,
+                        and save a CSV with every scored headline
+
+Run it with: python gold_backtest.py
+
+Needs:
+  ANTHROPIC_API_KEY     - same key your live bot uses
+  ALPHAVANTAGE_API_KEY  - free key: https://www.alphavantage.co/support/#api-key
+
+Install deps:
+  pip install anthropic requests yfinance pandas
+
+IMPORTANT CAVEATS (read before trusting the numbers):
+  - This checks DIRECTIONAL accuracy of the sentiment call, not real trading
+    P&L. It ignores spread, slippage, and execution delay.
+  - Alpha Vantage free tier = 25 requests/day. One request can return up to
+    1000 articles for a date range, so a single run usually fits in 1 call,
+    but don't re-run this script many times in a day while testing.
+  - yfinance hourly ("1h") data is only available for roughly the last 730
+    days. For older history you'd need daily ("1d") resolution instead.
+  - A backtest showing an edge does NOT guarantee that edge holds going
+    forward (markets adapt, and this is a small, simple signal).
+"""
+
+import os
+import sys
+import json
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+import pandas as pd
+import yfinance as yf
+from anthropic import Anthropic, APIStatusError
+
+# Set to True to also send the summary to Telegram (needs TELEGRAM_BOT_TOKEN
+# and TELEGRAM_CHAT_ID env vars — same ones your live bot uses).
+SEND_TELEGRAM = True
+
+# ---------- CONFIG ----------
+
+ALPHA_VANTAGE_KEY = os.environ["ALPHAVANTAGE_API_KEY"]
+client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
+
+GOLD_TICKER = "GC=F"          # COMEX gold futures on yfinance
+LOOKBACK_DAYS = 180           # how far back to pull headlines (tune as needed)
+FORWARD_WINDOWS_HOURS = (4, 24)  # check price move 4h and 24h after each headline
+JUDGE_BATCH_SIZE = 20         # headlines per Claude call (keeps prompts manageable)
+
+# Same relevance filter as the live bot, so the backtest tests the same
+# universe of headlines the bot would actually see.
+GOLD_KEYWORDS = ["gold", "bullion", "xau", "precious metal"]
+MACRO_KEYWORDS = [
+    "federal reserve", "fed chair", "fomc", "interest rate", "rate hike",
+    "rate cut", "rate decision", "jackson hole", "central bank",
+    "ecb", "bank of japan", "boj",
+    "inflation", "cpi", "pce", "consumer price index", "core inflation",
+    "dollar index", "u.s. dollar", "us dollar", "greenback", "treasury yield",
+    "bond yield", "10-year yield", "real yields",
+    "nonfarm payrolls", "jobs report", "unemployment rate", "recession",
+    "gdp growth",
+    "geopolitical", "war", "sanctions", "conflict", "banking crisis",
+    "debt ceiling", "government shutdown", "sovereign debt",
+    "budget deficit", "national debt", "treasury buyback",
+    "stock market selloff", "market crash", "safe haven",
+]
+
+
+def is_relevant(title):
+    t = title.lower()
+    return any(k in t for k in GOLD_KEYWORDS) or any(k in t for k in MACRO_KEYWORDS)
+
+
+# ---------- 1. FETCH HISTORICAL HEADLINES ----------
+
+def fetch_historical_headlines(time_from, time_to, limit=1000):
+    """Pull historical headlines with real publish timestamps from Alpha
+    Vantage. Returns a list of dicts: title, time_published (UTC datetime), source."""
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "topics": "economy_macro,financial_markets,economy_monetary",
+        "time_from": time_from.strftime("%Y%m%dT%H%M"),
+        "time_to": time_to.strftime("%Y%m%dT%H%M"),
+        "limit": limit,
+        "sort": "EARLIEST",
+        "apikey": ALPHA_VANTAGE_KEY,
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "feed" not in data:
+        print(f"Alpha Vantage returned no 'feed' key. Raw response: {data}")
+        return []
+
+    headlines = []
+    for item in data["feed"]:
+        title = item.get("title", "").strip()
+        ts_raw = item.get("time_published")  # format: YYYYMMDDTHHMMSS
+        if not title or not ts_raw:
+            continue
+        try:
+            ts = datetime.strptime(ts_raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        headlines.append({
+            "title": title,
+            "time_published": ts,
+            "source": item.get("source", ""),
+        })
+
+    return headlines
+
+
+# ---------- 2. FETCH HISTORICAL GOLD PRICES ----------
+
+def fetch_gold_prices(start, end, interval="1h"):
+    """Returns a DataFrame indexed by UTC datetime with a 'Close' column."""
+    df = yf.download(GOLD_TICKER, start=start, end=end, interval=interval, progress=False)
+    if df.empty:
+        raise RuntimeError(
+            "No price data returned. Check the date range and interval "
+            "(yfinance hourly data usually only goes back ~730 days)."
+        )
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+    return df
+
+
+def price_at_or_after(df, ts):
+    future = df[df.index >= ts]
+    if future.empty:
+        return None
+    return future.iloc[0]
+
+
+def forward_return(df, ts, hours_ahead):
+    """% price change from the first bar at/after ts to the first bar at/after
+    ts + hours_ahead. Returns None if either side falls outside the data."""
+    entry = price_at_or_after(df, ts)
+    if entry is None:
+        return None
+    target_ts = entry.name + timedelta(hours=hours_ahead)
+    exit_bar = price_at_or_after(df, target_ts)
+    if exit_bar is None:
+        return None
+    entry_close = float(entry["Close"])
+    exit_close = float(exit_bar["Close"])
+    return (exit_close - entry_close) / entry_close
+
+
+# ---------- 3. JUDGE (same prompt/logic as the live bot, batched) ----------
+
+JUDGE_PROMPT = """You are a financial news classifier. You will be given a numbered list of \
+news headlines about gold or markets. For EACH headline, decide whether it is short-term \
+BULLISH, BEARISH, or NEUTRAL for the gold price.
+
+Rules of thumb:
+- Hawkish Fed / rate hikes / strong dollar / rising real yields -> usually BEARISH for gold
+- Dovish Fed / rate cuts / weak dollar / falling real yields -> usually BULLISH for gold
+- Safe-haven demand (war, crisis, debt fears, bank stress) -> usually BULLISH for gold
+- Risk-on rallies in stocks with calm markets -> usually mildly BEARISH for gold
+- If a headline is ambiguous, mixed, or not really about a market-moving driver -> NEUTRAL
+
+Respond ONLY with a compact JSON array, no other text, with exactly one object per headline, \
+in the same order as given, in this exact shape:
+[{"index": 1, "verdict": "bullish" | "bearish" | "neutral", "reason": "one short plain-English sentence"}, ...]
+
+Headlines:
+{headline_list}
+"""
+
+
+def judge_batch(batch):
+    numbered = "\n".join(f"{i+1}. {h['title']}" for i, h in enumerate(batch))
+    prompt = JUDGE_PROMPT.replace("{headline_list}", numbered)
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200 + 100 * len(batch),
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        results = json.loads(raw)
+        by_index = {r.get("index"): r for r in results if isinstance(r, dict)}
+
+        out = []
+        for i in range(len(batch)):
+            r = by_index.get(i + 1)
+            if not r:
+                out.append({"verdict": "neutral", "reason": "(could not score)"})
+                continue
+            verdict = str(r.get("verdict", "neutral")).lower()
+            if verdict not in ("bullish", "bearish", "neutral"):
+                verdict = "neutral"
+            out.append({"verdict": verdict, "reason": r.get("reason", "")})
+        return out
+
+    except APIStatusError as e:
+        if e.status_code == 400 and "credit balance" in str(e).lower():
+            print(f"BILLING ISSUE — stopping run: {e}")
+            sys.exit(1)
+        print(f"Judge error on batch: {e}")
+        return [{"verdict": "neutral", "reason": "(error)"} for _ in batch]
+
+    except Exception as e:
+        print(f"Judge error on batch: {e}")
+        return [{"verdict": "neutral", "reason": "(error)"} for _ in batch]
+
+
+def judge_all_headlines(headlines, batch_size=JUDGE_BATCH_SIZE):
+    results = []
+    for i in range(0, len(headlines), batch_size):
+        batch = headlines[i:i + batch_size]
+        print(f"  Judging headlines {i+1}-{i+len(batch)} of {len(headlines)}...")
+        results.extend(judge_batch(batch))
+        time.sleep(0.3)
+    return results
+
+
+# ---------- 4. SCORE THE BACKTEST ----------
+
+def run_backtest(headlines, price_df, windows=FORWARD_WINDOWS_HOURS):
+    verdicts = judge_all_headlines(headlines)
+
+    rows = []
+    for h, v in zip(headlines, verdicts):
+        row = {
+            "title": h["title"],
+            "time_published": h["time_published"],
+            "verdict": v["verdict"],
+            "reason": v["reason"],
+        }
+        for w in windows:
+            row[f"return_{w}h"] = forward_return(price_df, h["time_published"], w)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def summarize_backtest(df, windows=FORWARD_WINDOWS_HOURS):
+    """Prints the backtest summary AND returns it as a plain-text string
+    (used for the Telegram message)."""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("BACKTEST RESULTS")
+    lines.append("=" * 60)
+
+    for w in windows:
+        col = f"return_{w}h"
+        sub = df.dropna(subset=[col])
+        if sub.empty:
+            lines.append(f"\n--- {w}h forward window: no data (price history didn't cover this range) ---")
+            continue
+
+        lines.append(f"\n--- {w}h forward window ({len(sub)} headlines with price data) ---")
+        for verdict in ("bullish", "bearish", "neutral"):
+            v = sub[sub["verdict"] == verdict][col]
+            if len(v) == 0:
+                lines.append(f"  {verdict:8s} n=0")
+                continue
+            avg_return = v.mean() * 100
+            if verdict == "bullish":
+                hit_rate = (v > 0).mean() * 100
+            elif verdict == "bearish":
+                hit_rate = (v < 0).mean() * 100
+            else:
+                hit_rate = None
+            hit_str = f"  hit_rate={hit_rate:.1f}%" if hit_rate is not None else ""
+            lines.append(f"  {verdict:8s} n={len(v):4d}  avg_return={avg_return:+.3f}%{hit_str}")
+
+        # Naive strategy: go long on "bullish" calls, short on "bearish" calls,
+        # sit flat on "neutral". No compounding, no costs — direction-only check.
+        def signal_return(r):
+            if r["verdict"] == "bullish":
+                return r[col]
+            elif r["verdict"] == "bearish":
+                return -r[col]
+            return 0.0
+
+        strat_returns = sub.apply(signal_return, axis=1)
+        lines.append(f"  Naive directional strategy: avg return/signal = {strat_returns.mean()*100:+.3f}%, "
+                      f"sum (no compounding) = {strat_returns.sum()*100:+.3f}%")
+
+    lines.append("\nReminder: this is directional accuracy only — no spread, slippage, or")
+    lines.append("execution delay included. A positive result here is a reason to keep")
+    lines.append("investigating, not a green light to trade real money.")
+
+    summary_text = "\n".join(lines)
+    print("\n" + summary_text)
+    return summary_text
+
+
+def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
+    """A shorter, HTML-formatted version of the summary for Telegram
+    (Telegram messages have a 4096-char limit, so keep this compact)."""
+    lines = ["<b>Gold Backtest — Weekly Report</b>", ""]
+
+    for w in windows:
+        col = f"return_{w}h"
+        sub = df.dropna(subset=[col])
+        if sub.empty:
+            lines.append(f"<b>{w}h window:</b> no price data")
+            continue
+
+        lines.append(f"<b>{w}h window</b> ({len(sub)} headlines)")
+        for verdict in ("bullish", "bearish", "neutral"):
+            v = sub[sub["verdict"] == verdict][col]
+            if len(v) == 0:
+                continue
+            avg_return = v.mean() * 100
+            if verdict == "bullish":
+                hit_rate = (v > 0).mean() * 100
+                hit_str = f", hit rate {hit_rate:.0f}%"
+            elif verdict == "bearish":
+                hit_rate = (v < 0).mean() * 100
+                hit_str = f", hit rate {hit_rate:.0f}%"
+            else:
+                hit_str = ""
+            emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}[verdict]
+            lines.append(f"{emoji} {verdict}: n={len(v)}, avg {avg_return:+.2f}%{hit_str}")
+        lines.append("")
+
+    lines.append("Directional accuracy only — not real P&L, no slippage/costs.")
+    lines.append("Full CSV is attached to this week's GitHub Actions run.")
+    return "\n".join(lines)
+
+
+def send_telegram_message(text):
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    resp = requests.post(url, data={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    })
+    if resp.status_code != 200:
+        print(f"Telegram send failed: {resp.status_code} {resp.text}")
+    else:
+        print("Telegram message sent.")
+
+
+# ---------- MAIN ----------
+
+def main():
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=LOOKBACK_DAYS)
+
+    print(f"Fetching headlines from {start.date()} to {end.date()}...")
+    raw_headlines = fetch_historical_headlines(start, end)
+    headlines = [h for h in raw_headlines if is_relevant(h["title"])]
+    print(f"{len(raw_headlines)} total headlines fetched, {len(headlines)} relevant after filtering.")
+
+    if not headlines:
+        print("No relevant headlines found in this window. Try widening LOOKBACK_DAYS or the topics filter.")
+        return
+
+    print("Fetching gold price history...")
+    price_df = fetch_gold_prices(start - timedelta(days=1), end + timedelta(days=2), interval="1h")
+    print(f"Got {len(price_df)} hourly price bars.")
+
+    print(f"Judging {len(headlines)} headlines in batches of {JUDGE_BATCH_SIZE}...")
+    df = run_backtest(headlines, price_df)
+
+    out_path = "backtest_results.csv"
+    df.to_csv(out_path, index=False)
+    print(f"\nFull results saved to {out_path}")
+
+    summarize_backtest(df)
+
+    if SEND_TELEGRAM:
+        telegram_text = format_telegram_summary(df)
+        send_telegram_message(telegram_text)
+
+
+if __name__ == "__main__":
+    main()
