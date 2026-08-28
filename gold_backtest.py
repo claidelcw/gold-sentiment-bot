@@ -162,6 +162,11 @@ def fetch_gold_prices(start, end, interval="1h"):
             "No price data returned. Check the date range and interval "
             "(yfinance hourly data usually only goes back ~730 days)."
         )
+    # Recent yfinance versions return MultiIndex columns like ('Close', 'GC=F')
+    # even for a single ticker. Flatten to plain column names ('Close', etc.)
+    # so downstream code can index with df["Close"] as expected.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     else:
@@ -176,6 +181,14 @@ def price_at_or_after(df, ts):
     return future.iloc[0]
 
 
+def _as_float(value):
+    """Safely coerce a price value to a plain float, even if pandas hands
+    back a length-1 Series (can happen with duplicate index timestamps)."""
+    if hasattr(value, "item"):
+        return float(value.item())
+    return float(value)
+
+
 def forward_return(df, ts, hours_ahead):
     """% price change from the first bar at/after ts to the first bar at/after
     ts + hours_ahead. Returns None if either side falls outside the data."""
@@ -186,8 +199,8 @@ def forward_return(df, ts, hours_ahead):
     exit_bar = price_at_or_after(df, target_ts)
     if exit_bar is None:
         return None
-    entry_close = float(entry["Close"])
-    exit_close = float(exit_bar["Close"])
+    entry_close = _as_float(entry["Close"])
+    exit_close = _as_float(exit_bar["Close"])
     return (exit_close - entry_close) / entry_close
 
 
