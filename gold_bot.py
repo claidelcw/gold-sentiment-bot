@@ -2,7 +2,7 @@
 Gold Sentiment Bot
 -------------------
 1. COLLECT   - pull recent gold-related headlines from a few free RSS feeds
-2. JUDGE     - ask Claude to score each headline: bullish / bearish / neutral
+2. JUDGE     - ask Claude to score ALL headlines in ONE call: bullish / bearish / neutral
 3. ADD IT UP - tally the votes into one verdict
 4. TELL YOU  - send the verdict + evidence to Telegram
 
@@ -15,10 +15,10 @@ Needs three environment variables (set as GitHub Actions secrets in production):
 
 import os
 import json
-import time
+import sys
 import feedparser
 import requests
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 
 # ---------- 1. COLLECT ----------
 
@@ -101,48 +101,72 @@ def collect_headlines():
     return unique[:MAX_HEADLINES]
 
 
-# ---------- 2. JUDGE ----------
+# ---------- 2. JUDGE (all headlines in a single API call) ----------
 
 client = Anthropic()  # reads ANTHROPIC_API_KEY from environment automatically
 
-JUDGE_PROMPT = """You are a financial news classifier. Given a single news headline about \
-gold or markets, decide whether it is short-term BULLISH, BEARISH, or NEUTRAL for the gold price.
+JUDGE_PROMPT = """You are a financial news classifier. You will be given a numbered list of \
+news headlines about gold or markets. For EACH headline, decide whether it is short-term \
+BULLISH, BEARISH, or NEUTRAL for the gold price.
 
 Rules of thumb:
 - Hawkish Fed / rate hikes / strong dollar / rising real yields -> usually BEARISH for gold
 - Dovish Fed / rate cuts / weak dollar / falling real yields -> usually BULLISH for gold
 - Safe-haven demand (war, crisis, debt fears, bank stress) -> usually BULLISH for gold
 - Risk-on rallies in stocks with calm markets -> usually mildly BEARISH for gold
-- If the headline is ambiguous, mixed, or not really about a market-moving driver -> NEUTRAL
+- If a headline is ambiguous, mixed, or not really about a market-moving driver -> NEUTRAL
 
-Respond ONLY with compact JSON, no other text, in this exact shape:
-{"verdict": "bullish" | "bearish" | "neutral", "reason": "one short plain-English sentence"}
+Respond ONLY with a compact JSON array, no other text, with exactly one object per headline, \
+in the same order as given, in this exact shape:
+[{"index": 1, "verdict": "bullish" | "bearish" | "neutral", "reason": "one short plain-English sentence"}, ...]
 
-Headline: "{headline}"
+Headlines:
+{headline_list}
 """
 
 
-def judge_headline(headline_text):
+def judge_all_headlines(headlines):
+    """Score every headline in a single API call. Returns a list of
+    (verdict, reason) tuples in the same order as the input headlines."""
+    numbered = "\n".join(f"{i+1}. {h['title']}" for i, h in enumerate(headlines))
+    prompt = JUDGE_PROMPT.replace("{headline_list}", numbered)
+
     try:
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=150,
-            messages=[{
-                "role": "user",
-                "content": JUDGE_PROMPT.replace("{headline}", headline_text)
-            }]
+            max_tokens=200 + 100 * len(headlines),  # scale room with headline count
+            messages=[{"role": "user", "content": prompt}]
         )
         raw = response.content[0].text.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
-        verdict = data.get("verdict", "neutral").lower()
-        if verdict not in ("bullish", "bearish", "neutral"):
-            verdict = "neutral"
-        reason = data.get("reason", "")
-        return verdict, reason
+        results = json.loads(raw)
+
+        # map by index so we're robust to the model re-ordering slightly
+        by_index = {r.get("index"): r for r in results if isinstance(r, dict)}
+
+        scored = []
+        for i, h in enumerate(headlines):
+            r = by_index.get(i + 1)
+            if not r:
+                scored.append(("neutral", "(could not score this one)"))
+                continue
+            verdict = str(r.get("verdict", "neutral")).lower()
+            if verdict not in ("bullish", "bearish", "neutral"):
+                verdict = "neutral"
+            reason = r.get("reason", "")
+            scored.append((verdict, reason))
+        return scored
+
+    except APIStatusError as e:
+        if e.status_code == 400 and "credit balance" in str(e).lower():
+            print(f"BILLING ISSUE — stopping run: {e}")
+            sys.exit(1)  # don't fall back to 15 fake "neutral" scores, just quit loudly
+        print(f"Judge error (API): {e}")
+        return [("neutral", "(could not score this one)") for _ in headlines]
+
     except Exception as e:
-        print(f"Judge error for '{headline_text}': {e}")
-        return "neutral", "(could not score this one)"
+        print(f"Judge error: {e}")
+        return [("neutral", "(could not score this one)") for _ in headlines]
 
 
 # ---------- 3. ADD IT UP ----------
@@ -207,12 +231,12 @@ def main():
         print("No gold-related headlines found this run. Skipping.")
         return
 
-    print(f"Found {len(headlines)} headlines. Judging each one...")
-    scored = []
-    for h in headlines:
-        verdict, reason = judge_headline(h["title"])
-        scored.append({**h, "verdict": verdict, "reason": reason})
-        time.sleep(0.3)  # be gentle on the API
+    print(f"Found {len(headlines)} headlines. Judging all of them in one call...")
+    results = judge_all_headlines(headlines)
+    scored = [
+        {**h, "verdict": v, "reason": r}
+        for h, (v, r) in zip(headlines, results)
+    ]
 
     overall, bulls, bears, neutrals = build_verdict(scored)
     message = format_message(overall, bulls, bears, neutrals, scored)
