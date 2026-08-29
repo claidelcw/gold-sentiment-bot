@@ -63,7 +63,9 @@ ALPHA_VANTAGE_KEY = os.environ["ALPHAVANTAGE_API_KEY"]
 client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
 
 GOLD_TICKER = "GC=F"          # COMEX gold futures on yfinance
-LOOKBACK_DAYS = 30            # how far back to pull headlines (see cap note below)
+LOOKBACK_DAYS = 10            # how far back to pull headlines — kept close to the
+                               # weekly run cadence so each run's log entry is mostly
+                               # NEW data, not a re-score of last week's headlines
 FORWARD_WINDOWS_HOURS = (1, 4, 24)  # check price move 1h, 4h, and 24h after each headline
 JUDGE_BATCH_SIZE = 20         # headlines per Claude call (keeps prompts manageable)
 
