@@ -298,6 +298,51 @@ def compute_baseline(price_df, windows=FORWARD_WINDOWS_HOURS):
     return baseline
 
 
+LOG_PATH = "backtest_log.csv"
+
+
+def log_run_to_csv(df, baseline, windows=FORWARD_WINDOWS_HOURS, log_path=LOG_PATH):
+    """Append one row per (window, bullish/bearish) to a running CSV log, so
+    results can be tracked across weeks instead of only seen one run at a
+    time. Creates the file with a header on the first run."""
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = []
+    for w in windows:
+        col = f"return_{w}h"
+        sub = df.dropna(subset=[col])
+        base_up = baseline.get(w) if baseline else None
+
+        for verdict in ("bullish", "bearish"):
+            v = sub[sub["verdict"] == verdict][col]
+            if len(v) == 0:
+                continue
+            if verdict == "bullish":
+                hit_rate = (v > 0).mean() * 100
+                base_ref = base_up
+            else:
+                hit_rate = (v < 0).mean() * 100
+                base_ref = (100 - base_up) if base_up is not None else None
+
+            rows.append({
+                "run_date": run_date,
+                "window_hours": w,
+                "verdict": verdict,
+                "n": len(v),
+                "hit_rate_pct": round(hit_rate, 1),
+                "baseline_pct": round(base_ref, 1) if base_ref is not None else "",
+                "hit_rate_minus_baseline": round(hit_rate - base_ref, 1) if base_ref is not None else "",
+                "avg_return_pct": round(v.mean() * 100, 3),
+            })
+
+    if not rows:
+        return
+
+    new_rows_df = pd.DataFrame(rows)
+    file_exists = os.path.exists(log_path)
+    new_rows_df.to_csv(log_path, mode="a", header=not file_exists, index=False)
+    print(f"Logged {len(rows)} rows to {log_path} (run_date={run_date}).")
+
+
 def run_backtest(headlines, price_df, windows=FORWARD_WINDOWS_HOURS):
     verdicts = judge_all_headlines(headlines)
 
@@ -484,6 +529,7 @@ def main():
     print(f"\nFull results saved to {out_path}")
 
     summarize_backtest(df, baseline=baseline)
+    log_run_to_csv(df, baseline=baseline)
 
     if SEND_TELEGRAM:
         telegram_text = format_telegram_summary(df, baseline=baseline)
