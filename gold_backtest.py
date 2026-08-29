@@ -277,6 +277,27 @@ def judge_all_headlines(headlines, batch_size=JUDGE_BATCH_SIZE):
 
 # ---------- 4. SCORE THE BACKTEST ----------
 
+def compute_baseline(price_df, windows=FORWARD_WINDOWS_HOURS):
+    """For each window, what % of ALL hours in the price history saw gold go
+    up over that window — regardless of any headline? This is the number to
+    beat: if a headline-based hit rate isn't meaningfully above this, the
+    'signal' is probably just riding the market's overall trend, not adding
+    real information."""
+    baseline = {}
+    for w in windows:
+        up_count = 0
+        total = 0
+        for ts in price_df.index:
+            r = forward_return(price_df, ts, w)
+            if r is None:
+                continue
+            total += 1
+            if r > 0:
+                up_count += 1
+        baseline[w] = (up_count / total * 100) if total > 0 else None
+    return baseline
+
+
 def run_backtest(headlines, price_df, windows=FORWARD_WINDOWS_HOURS):
     verdicts = judge_all_headlines(headlines)
 
@@ -295,9 +316,11 @@ def run_backtest(headlines, price_df, windows=FORWARD_WINDOWS_HOURS):
     return pd.DataFrame(rows)
 
 
-def summarize_backtest(df, windows=FORWARD_WINDOWS_HOURS):
+def summarize_backtest(df, baseline=None, windows=FORWARD_WINDOWS_HOURS):
     """Prints the backtest summary AND returns it as a plain-text string
-    (used for the Telegram message)."""
+    (used for the Telegram message). `baseline` is the dict from
+    compute_baseline() — the % of ALL hours (not just headline hours) where
+    gold went up over each window, used as the "beat this" reference."""
     lines = []
     lines.append("=" * 60)
     lines.append("BACKTEST RESULTS")
@@ -310,7 +333,9 @@ def summarize_backtest(df, windows=FORWARD_WINDOWS_HOURS):
             lines.append(f"\n--- {w}h forward window: no data (price history didn't cover this range) ---")
             continue
 
-        lines.append(f"\n--- {w}h forward window ({len(sub)} headlines with price data) ---")
+        base_up = baseline.get(w) if baseline else None
+        base_str = f" | baseline: gold rose {base_up:.1f}% of ALL hours" if base_up is not None else ""
+        lines.append(f"\n--- {w}h forward window ({len(sub)} headlines with price data){base_str} ---")
         for verdict in ("bullish", "bearish", "neutral"):
             v = sub[sub["verdict"] == verdict][col]
             if len(v) == 0:
@@ -348,9 +373,11 @@ def summarize_backtest(df, windows=FORWARD_WINDOWS_HOURS):
     return summary_text
 
 
-def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
+def format_telegram_summary(df, baseline=None, windows=FORWARD_WINDOWS_HOURS):
     """A plain-English, HTML-formatted version of the summary for Telegram
-    (Telegram messages have a 4096-char limit, so keep this compact)."""
+    (Telegram messages have a 4096-char limit, so keep this compact).
+    `baseline` is the dict from compute_baseline() — used to show whether
+    the bot is beating "gold was just trending" or not."""
     lines = ["<b>Gold Backtest — Weekly Report</b>", ""]
 
     for w in windows:
@@ -360,7 +387,11 @@ def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
             lines.append(f"<b>{w} hours after the headline:</b> no price data")
             continue
 
+        base_up = baseline.get(w) if baseline else None
         lines.append(f"<b>Looking {w} hours after each headline</b> ({len(sub)} headlines checked)")
+        if base_up is not None:
+            lines.append(f"<i>(For comparison: gold rose after {base_up:.0f}% of ALL {w}h periods in this stretch, headline or not.)</i>")
+
         for verdict in ("bullish", "bearish", "neutral"):
             v = sub[sub["verdict"] == verdict][col]
             if len(v) == 0:
@@ -371,17 +402,26 @@ def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
 
             if verdict == "bullish":
                 hit_rate = (v > 0).mean() * 100
+                beat_str = ""
+                if base_up is not None:
+                    diff = hit_rate - base_up
+                    beat_str = f" (baseline: {base_up:.0f}%, {'beats it' if diff > 3 else 'about the same as' if abs(diff) <= 3 else 'below it'})"
                 lines.append(
                     f"{emoji} {len(v)} headlines called BULLISH — gold moved {direction} "
                     f"{abs(avg_return):.2f}% on average afterward. It was actually right "
-                    f"(price went up) {hit_rate:.0f}% of the time."
+                    f"(price went up) {hit_rate:.0f}% of the time{beat_str}."
                 )
             elif verdict == "bearish":
                 hit_rate = (v < 0).mean() * 100
+                base_down = (100 - base_up) if base_up is not None else None
+                beat_str = ""
+                if base_down is not None:
+                    diff = hit_rate - base_down
+                    beat_str = f" (baseline: {base_down:.0f}%, {'beats it' if diff > 3 else 'about the same as' if abs(diff) <= 3 else 'below it'})"
                 lines.append(
                     f"{emoji} {len(v)} headlines called BEARISH — gold moved {direction} "
                     f"{abs(avg_return):.2f}% on average afterward. It was actually right "
-                    f"(price went down) {hit_rate:.0f}% of the time."
+                    f"(price went down) {hit_rate:.0f}% of the time{beat_str}."
                 )
             else:
                 lines.append(
@@ -390,8 +430,9 @@ def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
                 )
         lines.append("")
 
-    lines.append("Note: a coin flip would get ~50% right by chance. Well above 50% ")
-    lines.append("across both time windows is a sign worth investigating further.")
+    lines.append("\"Beats it\" means the bot's calls were right meaningfully more often")
+    lines.append("than gold's normal up/down tendency during this period — i.e. the")
+    lines.append("signal may add real information, not just ride a general trend.")
     lines.append("This checks direction only, not real trading profit — no fees, ")
     lines.append("spreads, or slippage included. Full details in this week's CSV.")
     return "\n".join(lines)
@@ -432,6 +473,9 @@ def main():
     price_df = fetch_gold_prices(start - timedelta(days=1), end + timedelta(days=2), interval="1h")
     print(f"Got {len(price_df)} hourly price bars.")
 
+    print("Computing baseline (gold's normal up/down tendency, independent of any headline)...")
+    baseline = compute_baseline(price_df)
+
     print(f"Judging {len(headlines)} headlines in batches of {JUDGE_BATCH_SIZE}...")
     df = run_backtest(headlines, price_df)
 
@@ -439,10 +483,10 @@ def main():
     df.to_csv(out_path, index=False)
     print(f"\nFull results saved to {out_path}")
 
-    summarize_backtest(df)
+    summarize_backtest(df, baseline=baseline)
 
     if SEND_TELEGRAM:
-        telegram_text = format_telegram_summary(df)
+        telegram_text = format_telegram_summary(df, baseline=baseline)
         send_telegram_message(telegram_text)
 
 
