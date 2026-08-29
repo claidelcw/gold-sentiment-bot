@@ -64,7 +64,7 @@ client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
 
 GOLD_TICKER = "GC=F"          # COMEX gold futures on yfinance
 LOOKBACK_DAYS = 30            # how far back to pull headlines (see cap note below)
-FORWARD_WINDOWS_HOURS = (4, 24)  # check price move 4h and 24h after each headline
+FORWARD_WINDOWS_HOURS = (1, 4, 24)  # check price move 1h, 4h, and 24h after each headline
 JUDGE_BATCH_SIZE = 20         # headlines per Claude call (keeps prompts manageable)
 
 # Same relevance filter as the live bot, so the backtest tests the same
@@ -349,7 +349,7 @@ def summarize_backtest(df, windows=FORWARD_WINDOWS_HOURS):
 
 
 def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
-    """A shorter, HTML-formatted version of the summary for Telegram
+    """A plain-English, HTML-formatted version of the summary for Telegram
     (Telegram messages have a 4096-char limit, so keep this compact)."""
     lines = ["<b>Gold Backtest — Weekly Report</b>", ""]
 
@@ -357,29 +357,43 @@ def format_telegram_summary(df, windows=FORWARD_WINDOWS_HOURS):
         col = f"return_{w}h"
         sub = df.dropna(subset=[col])
         if sub.empty:
-            lines.append(f"<b>{w}h window:</b> no price data")
+            lines.append(f"<b>{w} hours after the headline:</b> no price data")
             continue
 
-        lines.append(f"<b>{w}h window</b> ({len(sub)} headlines)")
+        lines.append(f"<b>Looking {w} hours after each headline</b> ({len(sub)} headlines checked)")
         for verdict in ("bullish", "bearish", "neutral"):
             v = sub[sub["verdict"] == verdict][col]
             if len(v) == 0:
                 continue
             avg_return = v.mean() * 100
+            emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}[verdict]
+            direction = "up" if avg_return >= 0 else "down"
+
             if verdict == "bullish":
                 hit_rate = (v > 0).mean() * 100
-                hit_str = f", hit rate {hit_rate:.0f}%"
+                lines.append(
+                    f"{emoji} {len(v)} headlines called BULLISH — gold moved {direction} "
+                    f"{abs(avg_return):.2f}% on average afterward. It was actually right "
+                    f"(price went up) {hit_rate:.0f}% of the time."
+                )
             elif verdict == "bearish":
                 hit_rate = (v < 0).mean() * 100
-                hit_str = f", hit rate {hit_rate:.0f}%"
+                lines.append(
+                    f"{emoji} {len(v)} headlines called BEARISH — gold moved {direction} "
+                    f"{abs(avg_return):.2f}% on average afterward. It was actually right "
+                    f"(price went down) {hit_rate:.0f}% of the time."
+                )
             else:
-                hit_str = ""
-            emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}[verdict]
-            lines.append(f"{emoji} {verdict}: n={len(v)}, avg {avg_return:+.2f}%{hit_str}")
+                lines.append(
+                    f"{emoji} {len(v)} headlines called NEUTRAL — gold moved {direction} "
+                    f"{abs(avg_return):.2f}% on average afterward (no strong call made)."
+                )
         lines.append("")
 
-    lines.append("Directional accuracy only — not real P&L, no slippage/costs.")
-    lines.append("Full CSV is attached to this week's GitHub Actions run.")
+    lines.append("Note: a coin flip would get ~50% right by chance. Well above 50% ")
+    lines.append("across both time windows is a sign worth investigating further.")
+    lines.append("This checks direction only, not real trading profit — no fees, ")
+    lines.append("spreads, or slippage included. Full details in this week's CSV.")
     return "\n".join(lines)
 
 
